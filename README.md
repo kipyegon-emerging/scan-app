@@ -1,5 +1,5 @@
 # Kobo Scan App
-### Emerging Leaders — Handwritten Form → KoboToolbox Automation
+### Handwritten Form → KoboToolbox Automation
 
 ---
 
@@ -31,22 +31,7 @@ Phone Camera / Photo
 
 ---
 
-## Project Structure
-```
-kobo-scan-app/
-├── backend/
-│   ├── main.py              # FastAPI backend (3 endpoints)
-│   └── requirements.txt     # Python dependencies
-├── frontend/
-│   └── index.html           # Single-file web app (works on any phone)
-├── config/
-│   └── field_map.json       # Kobo form field definitions
-├── .env.example             # Environment variables template
-├── render.yaml              # Render.com deployment config
-└── README.md
-```
 
----
 
 ## Setup — Step by Step
 
