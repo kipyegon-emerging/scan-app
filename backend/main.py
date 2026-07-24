@@ -1,0 +1,640 @@
+"""
+Kobo Scan App - Backend API
+ACCURACY IMPROVEMENTS (no new APIs, no extra cost):
+  - Image preprocessing: sharpen + contrast boost before Vision OCR
+  - Claude returns confidence per field (high/low)
+  - Only low-confidence fields flagged for review
+  - High-confidence fields auto-accepted, shown collapsed
+
+PERFORMANCE IMPROVEMENTS:
+  - Keep-alive self-ping every 14 minutes prevents Render free-tier cold starts
+  - Runs as a background task on startup — zero cost, zero config needed
+"""
+
+import os
+import json
+import base64
+import httpx
+import re
+import uuid
+import asyncio
+import hashlib
+from datetime import datetime
+from pathlib import Path
+from typing import List, AsyncGenerator, Any
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import StreamingResponse
+from dotenv import load_dotenv
+from PIL import Image, ImageFilter, ImageEnhance, ImageOps, ImageStat
+import io
+from contextlib import asynccontextmanager
+from functools import lru_cache
+from .audit import AuditStore
+from .validation import normalize_and_validate, score_field, validate_submission
+
+load_dotenv()
+
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
+MAX_PAGES = int(os.getenv("MAX_PAGES", "10"))
+AUTO_ACCEPT_THRESHOLD = int(os.getenv("AUTO_ACCEPT_THRESHOLD", "90"))
+ALLOWED_CONTENT_TYPES = {"image/jpeg", "image/png", "image/webp"}
+AUDIT_STORE = AuditStore(Path(os.getenv("AUDIT_DB_PATH", str(Path(__file__).parent / "data" / "audit.db"))))
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), limits=httpx.Limits(max_connections=25, max_keepalive_connections=10))
+    yield
+    await app.state.http.aclose()
+
+app = FastAPI(title="Kobo Scan App", lifespan=lifespan)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin],
+    allow_credentials=bool(os.getenv("CORS_ORIGINS")),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+CONFIG_DIR = Path(__file__).parent.parent / "config"
+FORMS_REGISTRY_PATH = CONFIG_DIR / "forms.json"
+with open(FORMS_REGISTRY_PATH) as f:
+    FORMS_REGISTRY = json.load(f)["forms"]
+
+@lru_cache(maxsize=32)
+def load_form_config(form_slug: str) -> dict:
+    if form_slug not in FORMS_REGISTRY:
+        raise HTTPException(status_code=404, detail=f"Form '{form_slug}' not found. Available: {list(FORMS_REGISTRY.keys())}")
+    form_meta = FORMS_REGISTRY[form_slug]
+    config_path = CONFIG_DIR / form_meta["config_file"]
+    if not config_path.exists():
+        raise HTTPException(status_code=500, detail=f"Config file missing: {form_meta['config_file']}")
+    with open(config_path) as f:
+        return json.load(f)
+
+KOBO_TOKEN = os.getenv("KOBO_TOKEN")
+GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+KOBO_BASE_URL = "https://kf.kobotoolbox.org/api/v2"
+KOBO_SUBMISSION_URL = "https://kc.kobotoolbox.org/api/v1/submissions"
+
+async def request_with_retry(method: str, url: str, **kwargs: Any) -> httpx.Response:
+    """Retry only transient transport/server failures while reusing the app client."""
+    last_error = None
+    for attempt in range(3):
+        try:
+            response = await app.state.http.request(method, url, **kwargs)
+            if response.status_code not in {408, 429, 500, 502, 503, 504}:
+                return response
+            last_error = RuntimeError(f"HTTP {response.status_code}")
+        except (httpx.TimeoutException, httpx.TransportError) as exc:
+            last_error = exc
+        if attempt < 2:
+            await asyncio.sleep(0.4 * (2 ** attempt))
+    raise HTTPException(status_code=503, detail="External service is temporarily unavailable; please retry.") from last_error
+
+
+# ═════════════════════════════════════════════════════════
+# KEEP-ALIVE SELF-PING
+# Render's free tier spins down servers after ~15 minutes
+# of inactivity, causing a 30–60 second "cold start" for
+# the next user. This background task pings /health every
+# 14 minutes so the server never reaches the idle threshold.
+#
+# How it works:
+#   - Starts automatically when the app boots (via @app.on_event)
+#   - Reads the app's own public URL from the RENDER_EXTERNAL_URL
+#     environment variable (set automatically by Render)
+#   - Falls back gracefully if the env var is missing (local dev)
+#   - Runs forever in the background — one lightweight GET per 14 min
+# ═════════════════════════════════════════════════════════
+KEEP_ALIVE_INTERVAL = 14 * 60  # 14 minutes in seconds
+
+async def keep_alive_loop():
+    """Pings /health every 14 minutes to prevent Render cold starts."""
+    # Wait 60 seconds after boot before first ping (let server settle)
+    await asyncio.sleep(60)
+
+    app_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not app_url:
+        # Not running on Render (local dev) — skip silently
+        print("[keep-alive] RENDER_EXTERNAL_URL not set — skipping keep-alive ping (local dev)")
+        return
+
+    ping_url = f"{app_url}/health"
+    print(f"[keep-alive] Starting keep-alive ping every {KEEP_ALIVE_INTERVAL // 60} minutes → {ping_url}")
+
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(ping_url)
+            print(f"[keep-alive] Pinged {ping_url} — status {resp.status_code}")
+        except Exception as e:
+            # Non-fatal — log and continue. Network blips shouldn't kill the loop.
+            print(f"[keep-alive] Ping failed (will retry): {e}")
+
+        await asyncio.sleep(KEEP_ALIVE_INTERVAL)
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Launch keep-alive as a background task on server start."""
+    asyncio.create_task(keep_alive_loop())
+# ═════════════════════════════════════════════════════════
+
+
+def build_submission_xml(fields: dict, asset_uid: str) -> tuple:
+    now = datetime.utcnow().isoformat() + "Z"
+    instance_id = str(uuid.uuid4())
+    field_lines = []
+    for key, value in fields.items():
+        if value is None or str(value).strip() in ("", "null", "None"):
+            continue
+        safe_value = str(value).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;").replace("'","&apos;")
+        field_lines.append(f"  <{key}>{safe_value}</{key}>")
+    fields_xml = "\n".join(field_lines)
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<{asset_uid} id="{asset_uid}">
+  <formhub><uuid>{asset_uid}</uuid></formhub>
+  <start>{now}</start><end>{now}</end>
+{fields_xml}
+  <meta><instanceID>uuid:{instance_id}</instanceID></meta>
+</{asset_uid}>"""
+    return xml, instance_id
+
+
+# ─────────────────────────────────────────────
+# IMAGE PREPROCESSING — improves OCR accuracy
+# Sharpen + contrast boost before sending to Vision
+# Especially helps with dim photos and faint handwriting
+# ─────────────────────────────────────────────
+def preprocess_image_for_ocr(contents: bytes) -> bytes:
+    img = Image.open(io.BytesIO(contents))
+
+    # Convert to RGB
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    # Resize to 1200px max — optimal for text OCR
+    max_dim = 1200
+    if max(img.size) > max_dim:
+        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+
+    # Convert to grayscale for OCR — removes colour noise that confuses Vision
+    img = img.convert("L")
+
+    # Sharpen edges — makes handwriting crisper
+    img = img.filter(ImageFilter.SHARPEN)
+    img = img.filter(ImageFilter.SHARPEN)  # Apply twice for stronger effect
+
+    # Boost contrast — makes dark ink stand out against paper
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(1.8)  # 1.8x contrast (1.0 = no change)
+
+    # Boost sharpness one more time after contrast
+    enhancer = ImageEnhance.Sharpness(img)
+    img = enhancer.enhance(2.0)
+
+    # Convert back to RGB for JPEG
+    img = img.convert("RGB")
+
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=90, optimize=True)
+    return buffer.getvalue()
+
+
+# ─────────────────────────────────────────────
+# CLAUDE PROMPT — asks for confidence per field
+# ─────────────────────────────────────────────
+def inspect_and_preprocess_image(contents: bytes) -> tuple[bytes, dict]:
+    """Validate, orient and gently enhance an image without damaging handwriting."""
+    img = Image.open(io.BytesIO(contents))
+    img.load()
+    img = ImageOps.exif_transpose(img)
+    original_size = img.size
+    gray = img.convert("L")
+    contrast = ImageStat.Stat(gray).var[0] ** 0.5
+    edge_detail = ImageStat.Stat(gray.filter(ImageFilter.FIND_EDGES)).var[0] ** 0.5
+    score = 100 - (20 if min(img.size) < 700 else 0) - (20 if contrast < 25 else 0) - (25 if edge_detail < 12 else 0)
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    if max(img.size) > 1800:
+        img.thumbnail((1800, 1800), Image.LANCZOS)
+    img = img.convert("L")
+    if contrast < 45:
+        img = ImageEnhance.Contrast(img).enhance(1.25)
+    if edge_detail >= 12:
+        img = ImageEnhance.Sharpness(img).enhance(1.15)
+    img = img.convert("RGB")
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=90, optimize=True)
+    quality = {"score": max(0, min(100, round(score))), "level": "excellent" if score >= 90 else "usable" if score >= 70 else "poor" if score >= 50 else "retake_recommended", "contrast": round(contrast, 1), "edge_detail": round(edge_detail, 1), "original_size": original_size, "processed_size": img.size}
+    return buffer.getvalue(), quality
+
+
+def build_claude_prompt(raw_text: str, form_config: dict) -> str:
+    fields_description = []
+    for field in form_config["fields"]:
+        ftype, fname, flabel = field["type"], field["kobo_name"], field["label"]
+        if ftype in ("select_one", "select_multiple"):
+            opts = "\n    ".join([f"KEY='{k}' → LABEL='{v}'" for k, v in field["options"].items()])
+            fields_description.append(
+                f"FIELD: {fname}\n  TYPE: {ftype}\n  QUESTION: {flabel}\n  OPTIONS:\n    {opts}")
+        elif ftype == "integer":
+            fields_description.append(
+                f"FIELD: {fname}\n  TYPE: integer\n  QUESTION: {flabel}\n"
+                f"  RULE: Digits only. Strip KES/Ksh/R/$/commas. Blank=null.")
+        elif ftype == "date":
+            fields_description.append(
+                f"FIELD: {fname}\n  TYPE: date\n  QUESTION: {flabel}\n"
+                f"  RULE: YYYY-MM-DD. '19/04/2026'→'2026-04-19'. Blank=null.")
+        else:
+            fields_description.append(
+                f"FIELD: {fname}\n  TYPE: text\n  QUESTION: {flabel}\n"
+                f"  RULE: Copy exactly as written. No autocorrect.")
+
+    return f"""You are a data entry specialist for handwritten survey forms.
+
+CHECKBOX DETECTION:
+OCR renders ticks as: √ ✓ V ✔ / — these mean SELECTED.
+Empty box □ ☐ = NOT selected.
+Examples: "□Male √Female" → female | "√Employed √Casual" → employed casual_work
+select_one: ONE key. select_multiple: ALL ticked keys space-separated. No match → null.
+
+TEXT: Copy exactly. No autocorrect. Illegible → null.
+NUMBERS: Digits only. "KES 15,000"→15000 "R 500"→500. Blank→null.
+DATES: YYYY-MM-DD. "19/04/2026"→"2026-04-19". Blank→null.
+
+RULES:
+1. Scan ALL pages.
+2. Only valid KEYs from options. Never invent keys.
+3. Return ONLY valid JSON. No markdown, no explanation.
+4. Blank/illegible → null.
+
+CONFIDENCE SCORING — IMPORTANT:
+For each field, also return a confidence score:
+  "high" = you can clearly see the answer in the OCR text
+  "low"  = the answer is ambiguous, partially visible, or you had to infer it
+
+Return a JSON object where each field has TWO keys:
+  "value": the extracted value (or null)
+  "confidence": "high" or "low"
+
+Example output format:
+{{
+  "First_Name": {{"value": "Jane", "confidence": "high"}},
+  "Age": {{"value": "18__29", "confidence": "high"}},
+  "County": {{"value": null, "confidence": "low"}},
+  "Approximately_how_mu_you_earn_in_a_month": {{"value": "15000", "confidence": "low"}}
+}}
+
+FORM: {form_config['form_title']}
+
+FIELDS:
+{chr(10).join(fields_description)}
+
+OCR TEXT:
+{raw_text}
+
+Return JSON only (with value + confidence per field):"""
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "forms_available": list(FORMS_REGISTRY.keys()),
+            "kobo_token": "set" if KOBO_TOKEN else "MISSING",
+            "vision_key": "set" if GOOGLE_VISION_API_KEY else "MISSING",
+            "anthropic_key": "set" if ANTHROPIC_API_KEY else "MISSING"}
+
+
+@app.get("/api/forms")
+def list_forms():
+    return {"forms": [{"slug": slug, "title": meta["title"], "description": meta["description"]}
+                      for slug, meta in FORMS_REGISTRY.items()]}
+
+
+@app.get("/api/count")
+async def get_submission_count(form: str = Query(...)):
+    if not KOBO_TOKEN:
+        raise HTTPException(status_code=500, detail="Kobo token not configured.")
+    form_config = load_form_config(form)
+    response = await request_with_retry("GET", f"{KOBO_BASE_URL}/assets/{form_config['asset_uid']}/submissions/?format=json&limit=1", headers={"Authorization": f"Token {KOBO_TOKEN}"})
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Could not fetch count: {response.status_code}")
+    return {"form": form, "form_title": form_config["form_title"],
+            "total_submissions": response.json().get("count", 0)}
+
+
+# ─────────────────────────────────────────────
+# STEP 1: OCR — PARALLEL + preprocessed images
+# ─────────────────────────────────────────────
+async def ocr_one_page(img_b64: str, page_label: str) -> tuple:
+    vision_url = f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+    payload = {"requests": [{"image": {"content": img_b64},
+                              "features": [{"type": "DOCUMENT_TEXT_DETECTION"}],
+                              "imageContext": {"languageHints": ["en"]}}]}
+    response = await request_with_retry("POST", vision_url, json=payload)
+    if response.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Vision API error ({page_label}): {response.text[:200]}")
+    try:
+        text = response.json()["responses"][0]["fullTextAnnotation"]["text"]
+    except (KeyError, IndexError):
+        text = ""
+    return page_label, text
+
+
+@app.post("/api/extract")
+async def extract_from_images(
+    files: List[UploadFile] = File(...),
+    form: str = Query(..., description="Form slug")
+):
+    if not GOOGLE_VISION_API_KEY:
+        raise HTTPException(status_code=500, detail="Google Vision API key not configured.")
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded.")
+    if len(files) > MAX_PAGES:
+        raise HTTPException(status_code=400, detail=f"Maximum {MAX_PAGES} pages allowed.")
+
+    load_form_config(form)
+
+    tasks = []
+    image_hashes, quality_reports = [], []
+    for i, file in enumerate(files):
+        if file.content_type not in ALLOWED_CONTENT_TYPES:
+            raise HTTPException(status_code=415, detail=f"Page {i+1} must be a JPEG, PNG, or WebP image.")
+        contents = await file.read()
+        if len(contents) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail=f"Page {i+1} exceeds the upload size limit.")
+        if not contents:
+            continue
+        try:
+            img = Image.open(io.BytesIO(contents))
+            img.verify()
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Invalid image on page {i+1}.")
+        try:
+            processed, quality = inspect_and_preprocess_image(contents)
+        except Exception:
+            raise HTTPException(status_code=400, detail=f"Unreadable or corrupted image on page {i+1}.")
+        image_hashes.append(hashlib.sha256(contents).hexdigest())
+        quality["page"] = i + 1
+        quality_reports.append(quality)
+        img_b64 = base64.b64encode(processed).decode("utf-8")
+        tasks.append(ocr_one_page(img_b64, f"Page {i+1}"))
+
+    if not tasks:
+        raise HTTPException(status_code=400, detail="No valid images found.")
+
+    # Parallel OCR
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_text_parts = []
+    for result in results:
+        if isinstance(result, Exception):
+            raise result
+        page_label, page_text = result
+        if page_text.strip():
+            all_text_parts.append(f"--- {page_label.upper()} ---\n{page_text}")
+
+    if not all_text_parts:
+        raise HTTPException(status_code=422,
+            detail="No text detected. Ensure forms are clearly visible and well-lit.")
+
+    merged_text = "\n\n".join(all_text_parts)
+    process_id = str(uuid.uuid4())
+    duplicates = AUDIT_STORE.duplicate_hashes(form, image_hashes)
+    AUDIT_STORE.create(process_id, form, image_hashes, quality_reports, merged_text)
+    return {"raw_text": merged_text, "pages": len(all_text_parts),
+            "char_count": len(merged_text), "form": form, "process_id": process_id,
+            "image_quality": quality_reports, "possible_duplicate_processes": duplicates}
+
+
+# ─────────────────────────────────────────────
+# STEP 2: MAP — Streaming + confidence scoring
+# ─────────────────────────────────────────────
+def recover_partial_json(text: str) -> dict:
+    """
+    Attempts to salvage fields from a truncated JSON response.
+    Extracts all complete "field": {"value": ..., "confidence": ...} pairs
+    that appeared before the response was cut off.
+    Returns a dict of whatever was successfully parsed.
+    """
+    recovered = {}
+    pattern = r'"([^"]+)"\s*:\s*\{[^}]*"value"\s*:\s*([^,}]+)[^}]*"confidence"\s*:\s*"(high|low)"[^}]*\}'
+    for match in re.finditer(pattern, text):
+        field_name = match.group(1)
+        raw_value = match.group(2).strip().strip('"')
+        confidence = match.group(3)
+        if raw_value.lower() in ("null", "none", ""):
+            recovered[field_name] = {"value": None, "confidence": confidence}
+        else:
+            recovered[field_name] = {"value": raw_value, "confidence": confidence}
+    return recovered
+
+
+async def stream_claude(raw_text: str, form_config: dict, process_id: str | None = None) -> AsyncGenerator[str, None]:
+    prompt = build_claude_prompt(raw_text, form_config)
+    payload = {
+        "model": "claude-sonnet-4-5",
+        "max_tokens": 8000,
+        "stream": True,
+        "messages": [{"role": "user", "content": prompt}]
+    }
+    full_response = ""
+    try:
+        async with app.state.http.stream(
+                "POST",
+                "https://api.anthropic.com/v1/messages",
+                headers={"Content-Type": "application/json",
+                         "anthropic-version": "2023-06-01",
+                         "x-api-key": ANTHROPIC_API_KEY},
+                json=payload
+            ) as response:
+                if response.status_code != 200:
+                    err = await response.aread()
+                    yield f"data: {json.dumps({'error': f'AI error: {err[:200].decode()}'})}\n\n"
+                    return
+                async for line in response.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    data_str = line[5:].strip()
+                    if data_str == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") == "content_block_delta":
+                        chunk = event.get("delta", {}).get("text", "")
+                        if chunk:
+                            full_response += chunk
+                            if len(full_response) % 50 == 0:
+                                yield f"data: {json.dumps({'type': 'progress', 'chars': len(full_response)})}\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        return
+
+    # Clean response
+    cleaned = full_response.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+
+    # Try full JSON parse first; fall back to partial recovery if truncated
+    raw_mapped = None
+    try:
+        raw_mapped = json.loads(cleaned)
+    except json.JSONDecodeError:
+        raw_mapped = recover_partial_json(cleaned)
+        if not raw_mapped:
+            yield f"data: {json.dumps({'error': 'AI response was cut short. Please try again — this usually resolves on retry.'})}\n\n"
+            return
+
+    # Parse confidence scores from Claude's response
+    valid_names = {f["kobo_name"] for f in form_config["fields"]}
+    mapped_fields = {}
+    confidence_map = {}
+
+    for k, v in raw_mapped.items():
+        if k not in valid_names:
+            continue
+        if isinstance(v, dict) and "value" in v:
+            field_value = v.get("value")
+            confidence = v.get("confidence", "low")
+        else:
+            field_value = v
+            confidence = "high"
+
+        if field_value is not None and str(field_value).strip() not in ("", "null", "None"):
+            mapped_fields[k] = field_value
+            confidence_map[k] = confidence
+        else:
+            confidence_map[k] = "low"
+
+    # Schema validation and application-derived confidence; never trust model labels alone.
+    image_quality = None
+    if process_id:
+        audit = AUDIT_STORE.get(process_id)
+        if audit:
+            reports = json.loads(audit["image_quality"])
+            image_quality = min((report["score"] for report in reports), default=None)
+    field_review = []
+    for field in form_config["fields"]:
+        fname = field["kobo_name"]
+        value, validation_errors = normalize_and_validate(field, mapped_fields.get(fname))
+        if value is not None:
+            mapped_fields[fname] = value
+        else:
+            mapped_fields.pop(fname, None)
+        confidence_score, confidence_level, needs_review, reason = score_field(value, confidence_map.get(fname, "low"), validation_errors, image_quality)
+        needs_review = confidence_score < field.get("confidence_threshold", AUTO_ACCEPT_THRESHOLD) or bool(validation_errors)
+        field_review.append({
+            "kobo_name": fname,
+            "label": field["label"],
+            "type": field["type"],
+            "value": value,
+            "captured": value is not None,
+            "confidence": confidence_level,
+            "confidence_score": confidence_score,
+            "needs_review": needs_review,
+            "validation_status": "valid" if not validation_errors else "invalid",
+            "reason": reason,
+            "options": field.get("options", {})
+        })
+
+    high_conf = sum(1 for f in field_review if not f["needs_review"])
+    needs_review_count = sum(1 for f in field_review if f["needs_review"])
+    if process_id:
+        AUDIT_STORE.update(process_id, ai_result=raw_mapped, validation_result=field_review, status="review")
+    yield f"data: {json.dumps({'type': 'done', 'mapped_fields': mapped_fields, 'field_count': len(mapped_fields), 'total_fields': len(form_config['fields']), 'high_confidence_count': high_conf, 'needs_review_count': needs_review_count, 'form_config': form_config, 'field_review': field_review, 'process_id': process_id})}\n\n"
+
+
+@app.post("/api/map")
+async def map_fields(payload: dict):
+    raw_text = payload.get("raw_text", "")
+    form_slug = payload.get("form", "")
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="No raw text provided.")
+    if not form_slug:
+        raise HTTPException(status_code=400, detail="No form slug provided.")
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="Anthropic API key not configured.")
+    form_config = load_form_config(form_slug)
+    process_id = payload.get("process_id")
+    return StreamingResponse(
+        stream_claude(raw_text, form_config, process_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
+
+
+@app.post("/api/submit")
+async def submit_to_kobo(payload: dict):
+    if not KOBO_TOKEN:
+        raise HTTPException(status_code=500, detail="Kobo API token not configured.")
+    fields = payload.get("fields", {})
+    form_slug = payload.get("form", "")
+    if not fields:
+        raise HTTPException(status_code=400, detail="No field data provided.")
+    if not form_slug:
+        raise HTTPException(status_code=400, detail="No form slug provided.")
+    form_config = load_form_config(form_slug)
+    process_id = payload.get("process_id")
+    if process_id:
+        prior = AUDIT_STORE.get(process_id)
+        if prior and prior["status"] == "submitted":
+            return {"success": True, "submission_id": prior["submission_id"], "form": form_slug, "form_title": form_config["form_title"], "idempotent": True}
+    clean_fields, validation_errors = validate_submission(fields, form_config)
+    if validation_errors:
+        if process_id:
+            AUDIT_STORE.update(process_id, final_data=clean_fields, validation_result=validation_errors, status="review", error="submission validation failed")
+        raise HTTPException(status_code=422, detail={"message": "Correct the invalid fields before submitting.", "fields": validation_errors})
+    xml_str, instance_id = build_submission_xml(clean_fields, form_config["asset_uid"])
+    try:
+        response = await request_with_retry("POST", KOBO_SUBMISSION_URL, headers={"Authorization": f"Token {KOBO_TOKEN}"}, files={"xml_submission_file": ("submission.xml", xml_str.encode("utf-8"), "text/xml")})
+    except HTTPException:
+        if process_id:
+            AUDIT_STORE.update(process_id, final_data=clean_fields, status="submission_failed", error="temporary Kobo network/server failure")
+        raise
+    if response.status_code in (200, 201):
+        if process_id:
+            AUDIT_STORE.update(process_id, final_data=clean_fields, status="submitted", submission_id=instance_id, error=None)
+        return {"success": True, "submission_id": instance_id, "form": form_slug,
+                "form_title": form_config["form_title"]}
+    if response.status_code in (401, 403):
+        failure = "Kobo authentication or permission failure"
+    elif 400 <= response.status_code < 500:
+        failure = "Kobo rejected the submission"
+    else:
+        failure = "Kobo server failure"
+    if process_id:
+        AUDIT_STORE.update(process_id, final_data=clean_fields, status="submission_failed", error=f"{failure} (HTTP {response.status_code})")
+    raise HTTPException(status_code=502,
+        detail=f"{failure} (HTTP {response.status_code}).")
+
+
+@app.get("/api/debug-kobo")
+async def debug_kobo(form: str = Query("el-baseline")):
+    if os.getenv("ENABLE_DEBUG_KOBO") != "true":
+        raise HTTPException(status_code=404, detail="Not found")
+    if not KOBO_TOKEN:
+        return {"error": "KOBO_TOKEN not set"}
+    form_config = load_form_config(form)
+    asset_uid = form_config["asset_uid"]
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        asset_resp = await client.get(f"{KOBO_BASE_URL}/assets/{asset_uid}/",
+                                      headers={"Authorization": f"Token {KOBO_TOKEN}"})
+    xml_str, instance_id = build_submission_xml({"First_Name": "TEST_DEBUG", "Last_Name": "DELETE_ME"}, asset_uid)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        sub_resp = await client.post(KOBO_SUBMISSION_URL,
+                                     headers={"Authorization": f"Token {KOBO_TOKEN}"},
+                                     files={"xml_submission_file": ("submission.xml", xml_str.encode("utf-8"), "text/xml")})
+    return {"form_tested": form,
+            "asset_check": {"status": asset_resp.status_code},
+            "xml_submission": {"status": sub_resp.status_code, "body": sub_resp.text[:300]}}
+
+
+frontend_path = Path(__file__).parent.parent / "frontend"
+if frontend_path.exists():
+    app.mount("/", StaticFiles(directory=str(frontend_path), html=True), name="static")

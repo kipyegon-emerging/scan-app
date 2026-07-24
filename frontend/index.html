@@ -1,0 +1,946 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Form Scanner</title>
+
+  <!-- ═══════════════════════════════════════════════════
+       SPLASH SCREEN — renders before ANY JS loads.
+       Users see this instantly even on cold Render start.
+       JavaScript hides it once the page is fully ready.
+  ═══════════════════════════════════════════════════ -->
+  <style>
+    #splash {
+      position: fixed;
+      inset: 0;
+      background: #1a365d;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      z-index: 9999;
+      gap: 20px;
+      transition: opacity 0.4s ease;
+    }
+    #splash.hide {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .splash-logo {
+      width: 72px;
+      height: 72px;
+      background: #3182ce;
+      border-radius: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 36px;
+    }
+    .splash-title {
+      color: white;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+    .splash-sub {
+      color: rgba(255,255,255,0.6);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 13px;
+    }
+    .splash-bar {
+      width: 160px;
+      height: 3px;
+      background: rgba(255,255,255,0.15);
+      border-radius: 99px;
+      overflow: hidden;
+    }
+    .splash-bar-inner {
+      height: 100%;
+      background: #63b3ed;
+      border-radius: 99px;
+      animation: splash-slide 1.1s ease-in-out infinite;
+    }
+    @keyframes splash-slide {
+      0%   { transform: translateX(-100%); }
+      100% { transform: translateX(260%); }
+    }
+  </style>
+</head>
+<body>
+
+<!-- Splash renders immediately, hidden once app is ready -->
+<div id="splash">
+  <div class="splash-logo">📋</div>
+  <div class="splash-title">Form Scanner</div>
+  <div class="splash-sub">Emerging Leaders</div>
+  <div class="splash-bar"><div class="splash-bar-inner"></div></div>
+</div>
+
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f0f4f8; color: #1a202c; min-height: 100vh; }
+
+  header { background: #1a365d; color: white; padding: 16px 20px; display: flex; align-items: center; gap: 12px; position: sticky; top: 0; z-index: 100; box-shadow: 0 2px 8px rgba(0,0,0,0.2); }
+  header h1 { font-size: 17px; font-weight: 600; }
+  header p { font-size: 12px; opacity: 0.75; margin-top: 2px; }
+  .logo { width: 36px; height: 36px; background: #3182ce; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 20px; flex-shrink: 0; }
+
+  main { padding: 20px; max-width: 640px; margin: 0 auto; }
+
+  .steps { display: flex; align-items: center; margin-bottom: 24px; background: white; border-radius: 12px; padding: 14px 16px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+  .step { display: flex; flex-direction: column; align-items: center; flex: 1; }
+  .step-circle { width: 28px; height: 28px; border-radius: 50%; background: #e2e8f0; color: #718096; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; transition: all 0.3s; }
+  .step.active .step-circle { background: #3182ce; color: white; }
+  .step.done .step-circle { background: #38a169; color: white; }
+  .step-label { font-size: 10px; color: #718096; margin-top: 4px; text-align: center; }
+  .step.active .step-label { color: #3182ce; font-weight: 600; }
+  .step.done .step-label { color: #38a169; }
+  .step-line { flex: 1; height: 2px; background: #e2e8f0; max-width: 32px; }
+  .step-line.done { background: #38a169; }
+
+  .card { background: white; border-radius: 16px; padding: 24px; box-shadow: 0 1px 4px rgba(0,0,0,0.08); margin-bottom: 16px; }
+  .card h2 { font-size: 17px; margin-bottom: 6px; color: #1a365d; }
+  .card p { font-size: 14px; color: #4a5568; line-height: 1.5; }
+
+  /* FORM SELECTOR */
+  .form-selector { margin-bottom: 20px; }
+  .form-selector label { display: block; font-size: 13px; font-weight: 600; color: #4a5568; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .form-selector select { width: 100%; padding: 12px 14px; border: 2px solid #3182ce; border-radius: 10px; font-size: 15px; font-weight: 500; color: #1a365d; background: white; outline: none; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%233182ce' stroke-width='2' fill='none'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 14px center; padding-right: 36px; }
+  .form-selector select:focus { border-color: #2c5282; box-shadow: 0 0 0 3px rgba(49,130,206,0.15); }
+
+  /* COUNTER BADGE */
+  .counter-badge { display: flex; align-items: center; gap: 10px; background: #ebf8ff; border: 1px solid #bee3f8; border-radius: 10px; padding: 10px 14px; margin-top: 12px; font-size: 13px; color: #2b6cb0; }
+  .counter-badge strong { font-size: 20px; color: #1a365d; }
+
+  /* PAGE SLOTS */
+  .page-slots { display: flex; flex-direction: column; gap: 12px; margin-top: 16px; }
+  .page-slot { border: 2px dashed #bee3f8; border-radius: 12px; overflow: hidden; background: #ebf8ff; }
+  .page-slot-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; cursor: pointer; }
+  .page-slot-header:hover { background: #dbeafe; }
+  .page-slot-label { font-size: 14px; font-weight: 600; color: #2b6cb0; display: flex; align-items: center; gap: 8px; }
+  .page-slot.has-image { border-color: #38a169; background: #f0fff4; }
+  .page-slot.has-image .page-slot-label { color: #276749; }
+  .page-slot-preview img { width: 100%; display: block; max-height: 200px; object-fit: cover; }
+  .page-slot-actions { display: flex; gap: 8px; padding: 8px 12px; background: rgba(0,0,0,0.04); }
+  .add-page-btn { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 12px; border: 2px dashed #90cdf4; border-radius: 12px; background: white; color: #3182ce; font-size: 14px; font-weight: 600; cursor: pointer; transition: all 0.2s; width: 100%; margin-top: 8px; }
+  .add-page-btn:hover { border-color: #3182ce; background: #ebf8ff; }
+
+  .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 12px 20px; border-radius: 10px; font-size: 15px; font-weight: 600; border: none; cursor: pointer; transition: all 0.2s; width: 100%; }
+  .btn-primary { background: #3182ce; color: white; }
+  .btn-primary:hover { background: #2c5282; }
+  .btn-primary:disabled { background: #90cdf4; cursor: not-allowed; }
+  .btn-success { background: #38a169; color: white; }
+  .btn-success:hover { background: #276749; }
+  .btn-success:disabled { background: #9ae6b4; cursor: not-allowed; }
+  .btn-outline { background: white; color: #4a5568; border: 2px solid #e2e8f0; }
+  .btn-outline:hover { border-color: #3182ce; color: #3182ce; }
+  .btn-danger { background: white; color: #e53e3e; border: 2px solid #fed7d7; font-size: 13px; padding: 6px 12px; width: auto; }
+  .btn-danger:hover { background: #fff5f5; }
+  .btn-sm { padding: 8px 14px; font-size: 13px; width: auto; }
+
+  .loading-overlay { display: none; position: fixed; inset: 0; background: rgba(26,32,64,0.7); z-index: 200; align-items: center; justify-content: center; flex-direction: column; gap: 16px; }
+  .loading-overlay.show { display: flex; }
+  .spinner { width: 48px; height: 48px; border: 4px solid rgba(255,255,255,0.2); border-top-color: white; border-radius: 50%; animation: spin 0.8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .loading-overlay p { color: white; font-size: 15px; font-weight: 500; text-align: center; padding: 0 20px; }
+
+  .field-group { margin-bottom: 16px; padding: 14px 16px; border-radius: 10px; border: 2px solid #e2e8f0; background: white; }
+  .field-group:last-child { margin-bottom: 0; }
+  .field-group.flagged { border-color: #fc8181; background: #fff5f5; }
+  .field-label { font-size: 12px; font-weight: 600; color: #718096; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+  .field-label.missing { color: #c53030; }
+  .field-label.low-conf { color: #c05621; }
+  .field-input { width: 100%; padding: 10px 12px; border: 2px solid #3182ce; border-radius: 8px; font-size: 15px; outline: none; background: white; }
+  .field-input.empty { border-color: #fc8181; background: #fff5f5; }
+  .checkbox-group { display: flex; flex-direction: column; gap: 6px; }
+  .checkbox-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 2px solid #e2e8f0; border-radius: 8px; cursor: pointer; transition: all 0.15s; }
+  .checkbox-item.checked { border-color: #3182ce; background: #ebf8ff; }
+  .checkbox-item input[type=checkbox] { width: 18px; height: 18px; accent-color: #3182ce; flex-shrink: 0; }
+  .checkbox-item label { font-size: 14px; cursor: pointer; }
+
+  /* SELECT ONE */
+  .select-one-group { display: flex; flex-direction: column; gap: 6px; }
+  .radio-item { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 2px solid #e2e8f0; border-radius: 8px; cursor: pointer; transition: all 0.15s; }
+  .radio-item.checked { border-color: #3182ce; background: #ebf8ff; }
+  .radio-item input[type=radio] { width: 18px; height: 18px; accent-color: #3182ce; flex-shrink: 0; }
+
+  .alert { padding: 12px 16px; border-radius: 10px; font-size: 14px; margin-bottom: 16px; display: flex; align-items: flex-start; gap: 10px; line-height: 1.5; }
+  .alert-warning { background: #fefcbf; border: 1px solid #f6e05e; color: #744210; }
+  .alert-success { background: #f0fff4; border: 1px solid #9ae6b4; color: #276749; }
+  .alert-error { background: #fff5f5; border: 1px solid #fc8181; color: #742a2a; }
+
+  /* CAPTURE SUMMARY */
+  .capture-summary { display: flex; gap: 10px; margin-bottom: 16px; }
+  .capture-stat { flex: 1; background: white; border-radius: 10px; padding: 12px; text-align: center; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+  .capture-stat .num { font-size: 24px; font-weight: 700; }
+  .capture-stat .lbl { font-size: 11px; color: #718096; margin-top: 2px; }
+  .capture-stat.good .num { color: #38a169; }
+  .capture-stat.warn .num { color: #dd6b20; }
+
+  .success-screen { text-align: center; padding: 40px 20px; }
+  .success-icon { font-size: 64px; margin-bottom: 16px; }
+  .success-screen h2 { font-size: 22px; color: #276749; margin-bottom: 8px; }
+  .success-screen p { font-size: 14px; color: #4a5568; margin-bottom: 24px; }
+  .submission-id { background: #f0fff4; border: 1px solid #9ae6b4; padding: 10px 16px; border-radius: 8px; font-family: monospace; font-size: 13px; color: #276749; margin-bottom: 24px; word-break: break-all; }
+
+  .hidden { display: none !important; }
+  .section-badge { display: inline-block; background: #1a365d; color: white; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 20px; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  input[type=file] { display: none; }
+</style>
+
+<header>
+  <div class="logo">📋</div>
+  <div>
+    <h1 id="header-title">Form Scanner</h1>
+    <p id="header-subtitle">Select a form to begin</p>
+  </div>
+</header>
+
+<main>
+  <div class="steps">
+    <div class="step active" id="step-1"><div class="step-circle">1</div><div class="step-label">Scan</div></div>
+    <div class="step-line" id="line-1"></div>
+    <div class="step active" id="step-2-ind"><div class="step-circle">2</div><div class="step-label">Extract</div></div>
+    <div class="step-line" id="line-2"></div>
+    <div class="step" id="step-3-ind"><div class="step-circle">3</div><div class="step-label">Review</div></div>
+    <div class="step-line" id="line-3"></div>
+    <div class="step" id="step-4-ind"><div class="step-circle">4</div><div class="step-label">Submit</div></div>
+  </div>
+
+  <!-- SCREEN 1: Upload -->
+  <div id="screen-upload">
+    <div class="card">
+      <h2>📋 Select Form</h2>
+      <p style="margin-bottom:14px">Choose the form you are scanning before uploading.</p>
+
+      <div class="form-selector">
+        <label>Form / Project</label>
+        <select id="form-select" onchange="onFormChange()">
+          <option value="">-- Select a form --</option>
+        </select>
+      </div>
+
+      <!-- Submission counter — shows after form selected -->
+      <div class="counter-badge hidden" id="counter-badge">
+        <span>📊</span>
+        <div>
+          <strong id="counter-num">—</strong>
+          <span id="counter-label"> submissions recorded</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="scan-card" style="display:none">
+      <h2>📸 Scan Form Pages</h2>
+      <p>Upload each page of the form separately. The app will combine all pages for one participant.</p>
+
+      <div class="page-slots" id="page-slots">
+        <div class="page-slot" id="slot-0">
+          <div class="page-slot-header" onclick="triggerFileInput(0)">
+            <div class="page-slot-label">📄 Page 1 <span style="font-weight:400;color:#718096">(required)</span></div>
+            <span style="font-size:20px">📷</span>
+          </div>
+          <div class="page-slot-preview" id="preview-0" style="display:none">
+            <img id="img-0" src="" alt="Page 1">
+            <div class="page-slot-actions">
+              <button class="btn btn-danger btn-sm" onclick="removePage(0)">✕ Remove</button>
+              <button class="btn btn-outline btn-sm" onclick="triggerFileInput(0)">♻ Retake</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <button class="add-page-btn" id="add-page-btn" onclick="addPageSlot()" style="display:none">
+        + Add Next Page
+      </button>
+
+      <div style="margin-top:16px">
+        <button class="btn btn-primary" id="extract-btn" onclick="extractFields()" disabled>
+          🔍 Extract Fields →
+        </button>
+      </div>
+
+      <div id="file-inputs"></div>
+    </div>
+
+    <div class="card" id="tips-card" style="display:none">
+      <h2>💡 Tips for best results</h2>
+      <p style="margin-bottom:8px">✅ Good lighting — no shadows on text</p>
+      <p style="margin-bottom:8px">✅ Hold phone directly above the form</p>
+      <p style="margin-bottom:8px">✅ All four edges of each page should be visible</p>
+      <p style="margin-bottom:8px">✅ Upload pages in order (Page 1 first)</p>
+      <p>✅ Ticks and handwriting should be clearly visible</p>
+    </div>
+  </div>
+
+  <!-- SCREEN 2: Review -->
+  <div id="screen-review" class="hidden">
+    <div class="alert alert-warning">
+      ⚠️ <strong>Review every field carefully before submitting.</strong> Tap any value to edit it. Red fields were not detected — enter them manually.
+    </div>
+
+    <!-- Capture summary stats -->
+    <div class="capture-summary" id="capture-summary"></div>
+
+    <div id="review-fields"></div>
+
+    <div class="card" style="margin-top:16px">
+      <button class="btn btn-success" id="submit-btn" onclick="submitToKobo()">✅ Confirm & Submit to Kobo</button>
+      <div style="margin-top:10px">
+        <button class="btn btn-outline" onclick="resetToUpload()">← Scan a Different Form</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SCREEN 3: Success -->
+  <div id="screen-success" class="hidden">
+    <div class="card">
+      <div class="success-screen">
+        <div class="success-icon">✅</div>
+        <h2>Submitted Successfully!</h2>
+        <p id="success-form-name">The form has been submitted to KoboToolbox.</p>
+        <div class="submission-id" id="submission-id-display"></div>
+        <button class="btn btn-primary" onclick="resetToUpload()">📸 Scan Another Form</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<div class="loading-overlay" id="loading">
+  <div class="spinner"></div>
+  <p id="loading-text">Processing...</p>
+</div>
+
+<script>
+  // ═══════════════════════════════════════════════════
+  // SPLASH: hide once page is interactive
+  // ═══════════════════════════════════════════════════
+  function hideSplash() {
+    const splash = document.getElementById('splash');
+    if (!splash) return;
+    splash.classList.add('hide');
+    setTimeout(() => splash.remove(), 450);
+  }
+
+  // ═══════════════════════════════════════════════════
+  // FORMS CACHE — avoids hitting /api/forms on every load.
+  // Stores the form list in sessionStorage for 10 minutes.
+  // On the same device/tab within that window, the dropdown
+  // populates instantly with no network call needed.
+  // ═══════════════════════════════════════════════════
+  const FORMS_CACHE_KEY = 'el_forms_cache_v1';
+  const FORMS_CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+
+  function getCachedForms() {
+    try {
+      const raw = sessionStorage.getItem(FORMS_CACHE_KEY);
+      if (!raw) return null;
+      const { data, timestamp } = JSON.parse(raw);
+      if (Date.now() - timestamp > FORMS_CACHE_TTL) return null;
+      return data;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function setCachedForms(data) {
+    try {
+      sessionStorage.setItem(FORMS_CACHE_KEY, JSON.stringify({ data, timestamp: Date.now() }));
+    } catch (e) {
+      // sessionStorage may be unavailable in some browsers — silently skip
+    }
+  }
+
+  // ── STATE ──
+  let selectedFiles = {};
+  let slotCount = 1;
+  let currentMappedFields = {};
+  let formConfig = null;
+  let currentFormSlug = '';
+  let fieldReview = [];
+  let currentProcessId = null;
+
+  // ── INIT: Load forms list — cache first, then network ──
+  async function loadForms() {
+    try {
+      const select = document.getElementById('form-select');
+      const urlParams = new URLSearchParams(window.location.search);
+      const urlForm = urlParams.get('form');
+
+      // Try cache first — instant if within TTL
+      let formsData = getCachedForms();
+
+      if (!formsData) {
+        // Cache miss — fetch from server
+        const resp = await fetch('/api/forms');
+        if (!resp.ok) { hideSplash(); return; }
+        formsData = await resp.json();
+        setCachedForms(formsData);
+      }
+
+      formsData.forms.forEach(f => {
+        const opt = document.createElement('option');
+        opt.value = f.slug;
+        opt.textContent = f.title;
+        if (f.slug === urlForm) opt.selected = true;
+        select.appendChild(opt);
+      });
+
+      // If URL had a form param, trigger the change
+      if (urlForm) {
+        select.value = urlForm;
+        onFormChange();
+      }
+    } catch(e) {
+      console.warn('Could not load forms list:', e);
+    } finally {
+      // Always hide splash once this function completes — success or failure
+      hideSplash();
+    }
+  }
+
+  // ── FORM SELECTION ──
+  async function onFormChange() {
+    const select = document.getElementById('form-select');
+    const slug = select.value;
+    currentFormSlug = slug;
+
+    if (!slug) {
+      document.getElementById('scan-card').style.display = 'none';
+      document.getElementById('tips-card').style.display = 'none';
+      document.getElementById('counter-badge').classList.add('hidden');
+      document.getElementById('header-subtitle').textContent = 'Select a form to begin';
+      return;
+    }
+
+    // Update header
+    const selectedText = select.options[select.selectedIndex].text;
+    document.getElementById('header-subtitle').textContent = selectedText;
+
+    // Show scan card
+    document.getElementById('scan-card').style.display = 'block';
+    document.getElementById('tips-card').style.display = 'block';
+
+    // Load submission count
+    loadCount(slug);
+  }
+
+  async function loadCount(slug) {
+    const badge = document.getElementById('counter-badge');
+    const numEl = document.getElementById('counter-num');
+    const lblEl = document.getElementById('counter-label');
+
+    badge.classList.remove('hidden');
+    numEl.textContent = '…';
+    lblEl.textContent = ' loading count…';
+
+    try {
+      const resp = await fetch(`/api/count?form=${encodeURIComponent(slug)}`);
+      if (!resp.ok) {
+        badge.classList.add('hidden');
+        return;
+      }
+      const data = await resp.json();
+      numEl.textContent = data.total_submissions;
+      lblEl.textContent = ' submissions recorded for this form';
+    } catch(e) {
+      badge.classList.add('hidden');
+    }
+  }
+
+  // ── CREATE FILE INPUT FOR A SLOT ──
+  function createFileInput(index) {
+    const existing = document.getElementById(`file-input-${index}`);
+    if (existing) existing.remove();
+
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.id = `file-input-${index}`;
+    input.accept = 'image/*';
+    input.capture = 'environment';
+    input.addEventListener('change', (e) => handleFileSelect(e, index));
+    document.getElementById('file-inputs').appendChild(input);
+  }
+
+  function triggerFileInput(index) {
+    if (!currentFormSlug) {
+      showError('Please select a form first.', 'upload');
+      return;
+    }
+    createFileInput(index);
+    document.getElementById(`file-input-${index}`).click();
+  }
+
+  // ── HANDLE FILE SELECTION ──
+  function handleFileSelect(e, index) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    selectedFiles[index] = file;
+
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const slot = document.getElementById(`slot-${index}`);
+      const preview = document.getElementById(`preview-${index}`);
+      const img = document.getElementById(`img-${index}`);
+
+      img.src = ev.target.result;
+      preview.style.display = 'block';
+      slot.classList.add('has-image');
+      updateUI();
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // ── ADD A NEW PAGE SLOT ──
+  function addPageSlot() {
+    if (slotCount >= 5) return;
+    const index = slotCount;
+    slotCount++;
+
+    const slot = document.createElement('div');
+    slot.className = 'page-slot';
+    slot.id = `slot-${index}`;
+    slot.innerHTML = `
+      <div class="page-slot-header" onclick="triggerFileInput(${index})">
+        <div class="page-slot-label">📄 Page ${index + 1}</div>
+        <span style="font-size:20px">📷</span>
+      </div>
+      <div class="page-slot-preview" id="preview-${index}" style="display:none">
+        <img id="img-${index}" src="" alt="Page ${index + 1}">
+        <div class="page-slot-actions">
+          <button class="btn btn-danger btn-sm" onclick="removePage(${index})">✕ Remove</button>
+          <button class="btn btn-outline btn-sm" onclick="triggerFileInput(${index})">♻ Retake</button>
+        </div>
+      </div>
+    `;
+    document.getElementById('page-slots').appendChild(slot);
+    updateUI();
+    setTimeout(() => triggerFileInput(index), 100);
+  }
+
+  // ── REMOVE A PAGE ──
+  function removePage(index) {
+    if (index === 0 && slotCount === 1) {
+      delete selectedFiles[index];
+      document.getElementById(`preview-${index}`).style.display = 'none';
+      document.getElementById(`slot-${index}`).classList.remove('has-image');
+    } else {
+      const slot = document.getElementById(`slot-${index}`);
+      if (slot) slot.remove();
+      delete selectedFiles[index];
+    }
+    updateUI();
+  }
+
+  // ── UPDATE UI STATE ──
+  function updateUI() {
+    const fileCount = Object.keys(selectedFiles).length;
+    const hasAtLeastOne = fileCount > 0;
+    document.getElementById('extract-btn').disabled = !hasAtLeastOne || !currentFormSlug;
+
+    const addBtn = document.getElementById('add-page-btn');
+    if (hasAtLeastOne && slotCount < 5) {
+      addBtn.style.display = 'flex';
+      addBtn.textContent = `+ Add Page ${slotCount + 1}`;
+    } else {
+      addBtn.style.display = 'none';
+    }
+  }
+
+  // ── EXTRACT FIELDS — with parallel OCR + streaming AI mapping ──
+  async function extractFields() {
+    if (!currentFormSlug) {
+      showError('Please select a form first.', 'upload');
+      return;
+    }
+
+    const fileEntries = Object.entries(selectedFiles);
+    if (fileEntries.length === 0) return;
+
+    const pageCount = fileEntries.length;
+    showLoading(pageCount > 1
+      ? `📸 Scanning ${pageCount} pages in parallel...`
+      : `📸 Scanning form...`);
+
+    const formData = new FormData();
+    fileEntries.sort((a, b) => parseInt(a[0]) - parseInt(b[0]));
+    fileEntries.forEach(([_, file]) => formData.append('files', file));
+
+    // ── STEP 1: OCR (parallel on backend) ──
+    let rawText;
+    try {
+      const extractResp = await fetch(`/api/extract?form=${encodeURIComponent(currentFormSlug)}`, {
+        method: 'POST',
+        body: formData
+      });
+      const extractData = await extractResp.json();
+
+      if (!extractResp.ok) {
+        hideLoading();
+        const errMsg = (extractData && extractData.detail) ? extractData.detail : 'OCR failed. Please try clearer images.';
+        showError(errMsg, 'upload');
+        return;
+      }
+      rawText = extractData.raw_text;
+      currentProcessId = extractData.process_id || null;
+      const lowQuality = (extractData.image_quality || []).filter(q => q.score < 70);
+      if (lowQuality.length) {
+        showError('Image quality is poor for ' + lowQuality.map(q => 'page ' + q.page).join(', ') + '. Retaking the photo is recommended.', 'upload');
+      }
+      if ((extractData.possible_duplicate_processes || []).length) {
+        showError('Possible duplicate image detected. Review carefully before submitting.', 'upload');
+      }
+      const pages = extractData.pages || 1;
+      updateLoading(`🤖 AI mapping fields from ${pages} page${pages > 1 ? 's' : ''}...`);
+    } catch(err) {
+      hideLoading();
+      showError('Network error during OCR: ' + err.message, 'upload');
+      return;
+    }
+
+    // ── STEP 2: AI field mapping — STREAMING ──
+    try {
+      const mapResp = await fetch('/api/map', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ raw_text: rawText, form: currentFormSlug, process_id: currentProcessId })
+      });
+
+      if (!mapResp.ok) {
+        const errData = await mapResp.json().catch(() => ({}));
+        hideLoading();
+        showError((errData && errData.detail) ? errData.detail : 'Field mapping failed.', 'upload');
+        return;
+      }
+
+      const reader = mapResp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let charsProcessed = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop();
+
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const dataStr = line.slice(5).trim();
+          if (!dataStr) continue;
+
+          let event;
+          try { event = JSON.parse(dataStr); } catch { continue; }
+
+          if (event.error) {
+            hideLoading();
+            showError(event.error, 'upload');
+            return;
+          }
+
+          if (event.type === 'progress') {
+            charsProcessed = event.chars || charsProcessed;
+            updateLoading(`🤖 AI reading form... (${charsProcessed} chars processed)`);
+          }
+
+          if (event.type === 'done') {
+            currentMappedFields = event.mapped_fields;
+            formConfig = event.form_config;
+            fieldReview = event.field_review || [];
+            hideLoading();
+            renderReview();
+            return;
+          }
+        }
+      }
+
+      hideLoading();
+      showError('AI response ended unexpectedly. Please try again.', 'upload');
+
+    } catch(err) {
+      hideLoading();
+      showError('Network error during field mapping: ' + err.message, 'upload');
+    }
+  }
+
+  // ── RENDER REVIEW SCREEN ──
+  function renderReview() {
+    const container = document.getElementById('review-fields');
+    container.innerHTML = '';
+
+    const total     = fieldReview.length;
+    const captured  = fieldReview.filter(f => f.captured).length;
+    const lowConf   = fieldReview.filter(f => f.captured && f.needs_review).length;
+    const missing   = fieldReview.filter(f => !f.captured).length;
+    const flagged   = lowConf + missing;
+
+    const summaryEl = document.getElementById('capture-summary');
+    summaryEl.innerHTML = `
+      <div class="capture-stat good">
+        <div class="num">${captured}</div>
+        <div class="lbl">Detected</div>
+      </div>
+      <div class="capture-stat ${flagged > 0 ? 'warn' : 'good'}">
+        <div class="num">${flagged}</div>
+        <div class="lbl">Check these ⚠️</div>
+      </div>
+      <div class="capture-stat">
+        <div class="num">${total}</div>
+        <div class="lbl">Total fields</div>
+      </div>
+    `;
+
+    const banner = document.createElement('div');
+    if (flagged > 0) {
+      banner.className = 'alert alert-warning';
+      banner.innerHTML = `⚠️ <strong>${flagged} field${flagged > 1 ? 's' : ''} flagged</strong> (red border) — check them carefully. All other fields are shown below — correct anything that looks wrong before submitting.`;
+    } else {
+      banner.className = 'alert alert-success';
+      banner.innerHTML = `✅ <strong>All ${total} fields detected.</strong> Scroll through and correct anything that looks wrong, then submit.`;
+    }
+    container.appendChild(banner);
+
+    const card = document.createElement('div');
+    card.className = 'card';
+    fieldReview.forEach(f => card.appendChild(createFieldGroup(f, f.value)));
+    container.appendChild(card);
+
+    document.getElementById('step-3-ind').classList.add('active');
+    document.getElementById('line-2').classList.add('done');
+    showScreen('review');
+    window.scrollTo(0, 0);
+  }
+
+  // ── CREATE EDITABLE FIELD GROUP ──
+  function createFieldGroup(field, value) {
+    const isFlagged = field.needs_review;
+    const group = document.createElement('div');
+    group.className = 'field-group' + (isFlagged ? ' flagged' : '');
+    group.dataset.fieldName = field.kobo_name;
+
+    const label = document.createElement('div');
+    if (!field.captured) {
+      label.className = 'field-label missing';
+      label.textContent = field.label + ' ⚠ NOT DETECTED — enter manually';
+    } else if (field.needs_review) {
+      label.className = 'field-label low-conf';
+      label.textContent = field.label + ` ⚠ CHECK — ${field.confidence_score || 0}% (${field.validation_status || 'review'}): ${field.reason || 'needs review'}`;
+    } else {
+      label.className = 'field-label';
+      label.textContent = field.label;
+    }
+    group.appendChild(label);
+
+    if (field.type === 'select_multiple') {
+      const checkGroup = document.createElement('div');
+      checkGroup.className = 'checkbox-group';
+      const selectedValues = value ? String(value).split(' ') : [];
+
+      for (const [optKey, optLabel] of Object.entries(field.options || {})) {
+        const item = document.createElement('label');
+        item.className = 'checkbox-item' + (selectedValues.includes(optKey) ? ' checked' : '');
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.value = optKey;
+        cb.checked = selectedValues.includes(optKey);
+        cb.addEventListener('change', () => {
+          updateSelectMultiple(field.kobo_name);
+          item.classList.toggle('checked', cb.checked);
+        });
+
+        const lbl = document.createElement('span');
+        lbl.textContent = optLabel;
+        item.appendChild(cb);
+        item.appendChild(lbl);
+        checkGroup.appendChild(item);
+      }
+      group.appendChild(checkGroup);
+
+    } else if (field.type === 'select_one') {
+      const radioGroup = document.createElement('div');
+      radioGroup.className = 'select-one-group';
+      const radioName = 'radio_' + field.kobo_name;
+
+      for (const [optKey, optLabel] of Object.entries(field.options || {})) {
+        const item = document.createElement('label');
+        item.className = 'radio-item' + (value === optKey ? ' checked' : '');
+
+        const rb = document.createElement('input');
+        rb.type = 'radio';
+        rb.name = radioName;
+        rb.value = optKey;
+        rb.checked = (value === optKey);
+        rb.addEventListener('change', () => {
+          currentMappedFields[field.kobo_name] = rb.value;
+          radioGroup.querySelectorAll('.radio-item').forEach(i => i.classList.remove('checked'));
+          item.classList.add('checked');
+        });
+
+        const lbl = document.createElement('span');
+        lbl.textContent = optLabel;
+        item.appendChild(rb);
+        item.appendChild(lbl);
+        radioGroup.appendChild(item);
+      }
+      group.appendChild(radioGroup);
+
+    } else {
+      const input = document.createElement('input');
+      input.className = 'field-input' + (!field.captured ? ' empty' : '');
+      input.type = field.type === 'integer' ? 'number' : (field.type === 'date' ? 'date' : 'text');
+      input.value = value || '';
+      input.placeholder = !field.captured ? '(not detected — enter manually)' : '';
+      input.addEventListener('change', () => {
+        currentMappedFields[field.kobo_name] = input.value || null;
+        input.classList.toggle('empty', !input.value);
+      });
+      group.appendChild(input);
+    }
+
+    return group;
+  }
+
+  function updateSelectMultiple(fieldName) {
+    const group = document.querySelector(`[data-field-name="${fieldName}"]`);
+    if (!group) return;
+    const checked = Array.from(group.querySelectorAll('input[type=checkbox]:checked')).map(cb => cb.value);
+    currentMappedFields[fieldName] = checked.length > 0 ? checked.join(' ') : null;
+  }
+
+  // ── SUBMIT TO KOBO ──
+  async function submitToKobo() {
+    collectCurrentValues();
+    document.getElementById('submit-btn').disabled = true;
+    showLoading('Submitting to KoboToolbox...');
+
+    try {
+      const resp = await fetch('/api/submit', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fields: currentMappedFields, form: currentFormSlug, process_id: currentProcessId })
+      });
+      const data = await resp.json();
+      hideLoading();
+
+      if (!resp.ok) {
+        document.getElementById('submit-btn').disabled = false;
+        const errMsg = (data && data.detail) ? data.detail : 'Kobo submission failed.';
+        showError('Submission failed: ' + errMsg, 'review');
+        return;
+      }
+
+      document.getElementById('submission-id-display').textContent =
+        'Submission ID: ' + (data.submission_id || 'Confirmed');
+      document.getElementById('success-form-name').textContent =
+        'Submitted to: ' + (data.form_title || 'KoboToolbox');
+      document.getElementById('step-4-ind').classList.add('done');
+      document.getElementById('line-3').classList.add('done');
+
+      if (currentFormSlug) loadCount(currentFormSlug);
+      showScreen('success');
+    } catch(err) {
+      hideLoading();
+      document.getElementById('submit-btn').disabled = false;
+      showError('Network error during submission: ' + err.message, 'review');
+    }
+  }
+
+  function collectCurrentValues() {
+    document.querySelectorAll('.field-group').forEach(group => {
+      const fieldName = group.dataset.fieldName;
+      const input = group.querySelector('.field-input');
+      if (input) currentMappedFields[fieldName] = input.value || null;
+    });
+  }
+
+  // ── UI HELPERS ──
+  function showScreen(name) {
+    ['upload','review','success'].forEach(s => {
+      document.getElementById(`screen-${s}`).classList.toggle('hidden', s !== name);
+    });
+  }
+
+  function showLoading(text) {
+    document.getElementById('loading-text').textContent = text;
+    document.getElementById('loading').classList.add('show');
+  }
+
+  function updateLoading(text) {
+    document.getElementById('loading-text').textContent = text;
+  }
+
+  function hideLoading() {
+    document.getElementById('loading').classList.remove('show');
+  }
+
+  function showError(msg, screenName) {
+    document.querySelectorAll('.alert-error').forEach(el => el.remove());
+    const alertEl = document.createElement('div');
+    alertEl.className = 'alert alert-error';
+    const safeMsg = (typeof msg === 'string') ? msg : JSON.stringify(msg);
+    alertEl.innerHTML = `⚠️ ${safeMsg}`;
+
+    const targetScreen = screenName
+      ? document.getElementById(`screen-${screenName}`)
+      : (document.getElementById('screen-review').classList.contains('hidden')
+          ? document.getElementById('screen-upload')
+          : document.getElementById('screen-review'));
+
+    const firstChild = targetScreen.firstElementChild;
+    targetScreen.insertBefore(alertEl, firstChild);
+    alertEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    setTimeout(() => alertEl.remove(), 15000);
+  }
+
+  function resetToUpload() {
+    selectedFiles = {};
+    slotCount = 1;
+    currentMappedFields = {};
+    formConfig = null;
+    fieldReview = [];
+    currentProcessId = null;
+
+    const slotsContainer = document.getElementById('page-slots');
+    slotsContainer.innerHTML = `
+      <div class="page-slot" id="slot-0">
+        <div class="page-slot-header" onclick="triggerFileInput(0)">
+          <div class="page-slot-label">📄 Page 1 <span style="font-weight:400;color:#718096">(required)</span></div>
+          <span style="font-size:20px">📷</span>
+        </div>
+        <div class="page-slot-preview" id="preview-0" style="display:none">
+          <img id="img-0" src="" alt="Page 1">
+          <div class="page-slot-actions">
+            <button class="btn btn-danger btn-sm" onclick="removePage(0)">✕ Remove</button>
+            <button class="btn btn-outline btn-sm" onclick="triggerFileInput(0)">♻ Retake</button>
+          </div>
+        </div>
+      </div>
+    `;
+
+    document.getElementById('file-inputs').innerHTML = '';
+    document.getElementById('add-page-btn').style.display = 'none';
+    document.getElementById('extract-btn').disabled = true;
+
+    ['step-2-ind','step-3-ind','step-4-ind'].forEach(id => {
+      document.getElementById(id).classList.remove('done','active');
+      if (id === 'step-2-ind') document.getElementById(id).classList.add('active');
+    });
+    ['line-1','line-2','line-3'].forEach(id => document.getElementById(id).classList.remove('done'));
+
+    if (currentFormSlug) loadCount(currentFormSlug);
+    showScreen('upload');
+    window.scrollTo(0, 0);
+  }
+
+  // ── BOOT ──
+  loadForms();
+</script>
+</body>
+</html>
